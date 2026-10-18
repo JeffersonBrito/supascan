@@ -10,6 +10,7 @@ class SupabaseClient:
     def __init__(self, creds: Credentials, verbose: bool = False):
         self.creds = creds
         self.verbose = verbose
+        self._openapi_resp: Optional[requests.Response] = None
         self._session = requests.Session()
         self._session.headers.update({
             "apikey": creds.anon_key,
@@ -32,10 +33,23 @@ class SupabaseClient:
             print(f"  [{method}] {url} → {status}")
 
     def get_openapi_spec(self) -> requests.Response:
-        url = self._url("/rest/v1/")
-        resp = self._session.get(url)
-        self._log("GET", url, resp.status_code)
-        return resp
+        # Cached: tables and RPC enumeration both read the same spec
+        if self._openapi_resp is None:
+            url = self._url("/rest/v1/")
+            self._openapi_resp = self._session.get(url)
+            self._log("GET", url, self._openapi_resp.status_code)
+        return self._openapi_resp
+
+    def openapi_error(self) -> Optional[str]:
+        """Return a human-readable reason if the OpenAPI spec is unavailable, else None."""
+        resp = self.get_openapi_spec()
+        if resp.status_code == 200:
+            return None
+        try:
+            message = resp.json().get("message", "")
+        except Exception:
+            message = resp.text[:200]
+        return f"{resp.status_code} {message}".strip()
 
     def get_auth_settings(self) -> requests.Response:
         url = self._url("/auth/v1/settings")

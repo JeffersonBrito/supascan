@@ -2,8 +2,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse
+from dataclasses import dataclass, field
+from typing import Iterator, Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -17,9 +18,12 @@ _RE_CREATE_CLIENT = re.compile(
     r'createClient\s*\(\s*[\'"]https://([a-z0-9]{20})\.supabase\.co[\'"]'
     r'\s*,\s*[\'"]([^\'"]+)[\'"]'
 )
-_RE_SUPABASE_KEY = re.compile(r'SUPABASE_(?:ANON_)?KEY\s*[=:]\s*[\'"]([^\'"]+)[\'"]')
-_RE_ANON_KEY = re.compile(r'anon[_-]?key[\'"]?\s*[=:]\s*[\'"]([^\'"]+)[\'"]')
+_RE_SUPABASE_KEY = re.compile(r'SUPABASE_(?:ANON_)?KEY\s*[=:]\s*[\'"]([^\'"]+)[\'"]', re.IGNORECASE)
+_RE_ANON_KEY = re.compile(r'anon[_-]?key[\'"]?\s*[=:]\s*[\'"]([^\'"]+)[\'"]', re.IGNORECASE)
 _RE_EDGE_FN = re.compile(r'functions\.invoke\s*\(\s*[\'"]([^\'"]+)[\'"]')
+# supabase.from('table') / .rpc('fn') — used when the OpenAPI spec is unavailable
+_RE_FROM = re.compile(r'\.from\(\s*[\'"`]([A-Za-z_][A-Za-z0-9_]*)[\'"`]\s*\)')
+_RE_RPC = re.compile(r'\.rpc\(\s*[\'"`]([A-Za-z_][A-Za-z0-9_]*)[\'"`]')
 # Tuple format: ('https://ref.supabase.co', 'eyJ...' or 'sb_publishable_...')
 _RE_TUPLE = re.compile(
     r'\(\s*[\'"]https://([a-z0-9]{20})\.supabase\.co[\'"]'
@@ -93,7 +97,7 @@ def _extract_credentials(content: str, source: str) -> Optional[Credentials]:
     # Key patterns
     if not anon_key:
         for pattern in (_RE_SUPABASE_KEY, _RE_ANON_KEY):
-            m = pattern.search(content, re.IGNORECASE)
+            m = pattern.search(content)
             if m:
                 candidate = m.group(1)
                 if _RE_JWT.match(candidate) or _RE_SB_PUBLISHABLE.fullmatch(candidate):
@@ -120,12 +124,43 @@ def find_edge_functions(content: str) -> list[str]:
     return list(dict.fromkeys(_RE_EDGE_FN.findall(content)))
 
 
+def find_table_names(content: str) -> list[str]:
+    return list(dict.fromkeys(_RE_FROM.findall(content)))
+
+
+def find_rpc_names(content: str) -> list[str]:
+    return list(dict.fromkeys(_RE_RPC.findall(content)))
+
+
+@dataclass
+class ResourceHints:
+    """Resource names referenced by client code, used when the OpenAPI spec is unavailable."""
+    tables: list[str] = field(default_factory=list)
+    rpcs: list[str] = field(default_factory=list)
+    edge_functions: list[str] = field(default_factory=list)
+    sources_scanned: int = 0
+
+    def add(self, content: str) -> None:
+        for dst, found in (
+            (self.tables, find_table_names(content)),
+            (self.rpcs, find_rpc_names(content)),
+            (self.edge_functions, find_edge_functions(content)),
+        ):
+            for name in found:
+                if name not in dst:
+                    dst.append(name)
+        self.sources_scanned += 1
+
+
 _CRAWL_PATHS = [
     "/", "/login", "/signin", "/signup", "/auth", "/dashboard",
     "/app", "/admin", "/home", "/index",
 ]
 
 _RE_JS_SRC = re.compile(r'(?:src|href)=["\']([^"\']*\.js(?:\?[^"\']*)?)["\']')
+# JS chunk references inside bundles: import("./x.js"), __vite__mapDeps(["assets/x.js"])
+_RE_JS_CHUNK = re.compile(r'[\'"`]((?:\.{1,2}/|/)?[A-Za-z0-9_./-]+\.js)[\'"`]')
+_MAX_JS_FILES = 300
 
 
 def _collect_js_urls(html: str, base: str) -> list[str]:
@@ -141,7 +176,19 @@ def _collect_js_urls(html: str, base: str) -> list[str]:
     return result
 
 
-def from_url(url: str) -> Optional[Credentials]:
+def _collect_chunk_urls(js: str, js_url: str, base: str) -> list[str]:
+    """Extract lazily-loaded chunk URLs referenced from inside a JS bundle."""
+    result: list[str] = []
+    for ref in _RE_JS_CHUNK.findall(js):
+        if ref.startswith(("./", "../")):
+            result.append(urljoin(js_url, ref))
+        else:
+            result.append(urljoin(base + "/", ref))
+    return [u for u in result if urlparse(u).netloc == urlparse(base).netloc]
+
+
+def _iter_sources(url: str, follow_chunks: bool = False) -> Iterator[tuple[str, str]]:
+    """Yield (source_url, text) for the target page, common sub-paths, and their JS files."""
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -161,10 +208,7 @@ def from_url(url: str) -> Optional[Credentials]:
             print(f"  [WARN] Failed to fetch {crawl_url}: {e}")
             continue
 
-        # Check the HTML/page itself first
-        creds = _extract_credentials(resp.text, source=crawl_url)
-        if creds:
-            return creds
+        yield crawl_url, resp.text
 
         # Collect JS URLs from this page
         for js_url in _collect_js_urls(resp.text, base):
@@ -172,17 +216,42 @@ def from_url(url: str) -> Optional[Credentials]:
                 seen_js.add(js_url)
                 all_js.append(js_url)
 
-    # Scan all collected JS files
-    for js_url in all_js:
+    # Scan all collected JS files (list grows as chunks are discovered)
+    i = 0
+    while i < len(all_js) and i < _MAX_JS_FILES:
+        js_url = all_js[i]
+        i += 1
         try:
             js_resp = requests.get(js_url, timeout=10)
-            creds = _extract_credentials(js_resp.text, source=js_url)
-            if creds:
-                return creds
         except Exception:
             continue
+        if js_resp.status_code != 200:
+            continue
+        yield js_url, js_resp.text
+        if follow_chunks:
+            for chunk in _collect_chunk_urls(js_resp.text, js_url, base):
+                if chunk not in seen_js:
+                    seen_js.add(chunk)
+                    all_js.append(chunk)
 
+
+def from_url(url: str) -> Optional[Credentials]:
+    for source, text in _iter_sources(url, follow_chunks=True):
+        creds = _extract_credentials(text, source=source)
+        if creds:
+            return creds
     return None
+
+
+def collect_hints(target: str) -> ResourceHints:
+    """Scan a URL (full crawl incl. lazy chunks) or local file for referenced resource names."""
+    hints = ResourceHints()
+    if target.startswith(("http://", "https://")):
+        for _, text in _iter_sources(target, follow_chunks=True):
+            hints.add(text)
+    elif Path(target).is_file():
+        hints.add(Path(target).read_text(errors="replace"))
+    return hints
 
 
 def from_html_file(path: str) -> Optional[Credentials]:

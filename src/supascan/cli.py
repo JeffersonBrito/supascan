@@ -14,10 +14,11 @@ from rich.text import Text
 
 from . import cache as cache_mod
 from .client import SupabaseClient
-from .discovery import find_edge_functions, from_har_file, from_html_file, from_js_file, from_url
-from .enumeration import enumerate_buckets, enumerate_rpc_functions, enumerate_tables
+from .discovery import ResourceHints, collect_hints, find_edge_functions, from_har_file, from_html_file, from_js_file, from_url
+from . import wordlist
+from .enumeration import enumerate_buckets, enumerate_rpc_functions, enumerate_tables, leak_rpc_names, leak_table_names
 from .models import AuditReport, Credentials, Finding, Severity
-from .testing import run_all_passive_checks
+from .testing import check_authenticated_access, run_all_passive_checks
 from .write_testing import run_write_tests
 
 console = Console(stderr=True)
@@ -118,6 +119,77 @@ def _get_client(ctx: click.Context, require_creds: bool = True) -> Optional[Supa
     return SupabaseClient(creds, verbose=verbose)
 
 
+def _warn_if_no_schema(client: SupabaseClient, hints: Optional[ResourceHints] = None, guessing: bool = False) -> None:
+    """Explain loudly when the OpenAPI spec is closed, so an empty scan isn't mistaken for a clean one."""
+    err = client.openapi_error()
+    if not err:
+        return
+    console.print(f"  [yellow]OpenAPI schema unavailable ({err}).[/yellow]")
+    if hints is None:
+        console.print("  [yellow]Tables/RPCs cannot be listed. Pass --hints-from <url|file> to probe names found in client JS.[/yellow]")
+    elif hints.tables or hints.rpcs:
+        console.print(
+            f"  [yellow]Falling back to names found in client JS ({hints.sources_scanned} sources): "
+            f"{len(hints.tables)} tables, {len(hints.rpcs)} RPCs.[/yellow]"
+        )
+    elif guessing:
+        console.print(f"  [yellow]No table/RPC names found in client JS ({hints.sources_scanned} sources).[/yellow]")
+    else:
+        _warn_zero_coverage()
+
+
+def _warn_zero_coverage() -> None:
+    console.print("  [red]Table coverage is ZERO — do not read 'No findings' as secure.[/red]")
+
+
+def _guess_names(client: SupabaseClient, hints: ResourceHints, wordlist_path: Optional[str]) -> None:
+    """Extend hints with names found by wordlist probing + PostgREST "Perhaps you meant" leakage."""
+    seeds = wordlist.load(wordlist_path, wordlist.TABLES)
+    console.print(f"  Probing {len(seeds)} candidate table names (wordlist + PostgREST hint leakage)...")
+    new_tables = [n for n in leak_table_names(client, seeds) if n not in hints.tables]
+    hints.tables.extend(new_tables)
+    new_rpcs = [n for n in leak_rpc_names(client, wordlist.RPCS) if n not in hints.rpcs]
+    hints.rpcs.extend(new_rpcs)
+    console.print(f"  Guessing found {len(new_tables)} tables, {len(new_rpcs)} RPCs")
+    if not hints.tables:
+        _warn_zero_coverage()
+
+
+def _token_valid(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    try:
+        import jwt
+        exp = jwt.decode(token, options={"verify_signature": False}).get("exp")
+        return exp is None or exp > datetime.now(timezone.utc).timestamp() + 60
+    except Exception:
+        return False
+
+
+def _obtain_user_token(client: SupabaseClient, email: Optional[str]) -> Optional[str]:
+    """Reuse a cached, unexpired user token, or sign up a throwaway account."""
+    if _token_valid(client.creds.user_token):
+        console.print("  [dim]Using cached user token[/dim]")
+        return client.creds.user_token
+    import secrets
+    email = email or f"supascan+{secrets.token_hex(4)}@example.com"
+    password = secrets.token_urlsafe(18)
+    resp = client.signup(email, password)
+    token = None
+    try:
+        token = resp.json().get("access_token") if resp.status_code in (200, 201) else None
+    except Exception:
+        pass
+    if not token:
+        console.print(f"  [yellow]Signup as {email} gave no session ({resp.status_code}: {resp.text[:150]}).[/yellow]")
+        console.print("  [yellow]Email confirmation is likely required: run 'supascan signup' with a real inbox, then rerun.[/yellow]")
+        return None
+    console.print(f"  [green]Signed up {email}[/green] [dim](delete this account after testing)[/dim]")
+    client.creds.user_token = token
+    cache_mod.add_credentials(client.creds)
+    return token
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -213,11 +285,21 @@ def discover(ctx, target, target_type, save):
 @click.option("--tables/--no-tables", default=True)
 @click.option("--rpc/--no-rpc", default=True)
 @click.option("--buckets/--no-buckets", default=True)
+@click.option("--hints-from", default=None, help="URL or JS/HTML file to scrape table/RPC names from when the OpenAPI spec is closed")
+@click.option("--guess/--no-guess", default=True, show_default=True,
+              help="When the OpenAPI spec is closed, probe a wordlist and harvest PostgREST name hints")
+@click.option("--wordlist", "wordlist_path", default=None, help="Table-name wordlist (one per line) for --guess")
 @click.pass_context
-def enum(ctx, tables, rpc, buckets):
+def enum(ctx, tables, rpc, buckets, hints_from, guess, wordlist_path):
     """Enumerate Supabase resources (tables, RPCs, buckets)."""
     client = _get_client(ctx)
     output = ctx.obj.get("output")
+    hints = None
+    if (tables or rpc) and client.openapi_error():
+        hints = collect_hints(hints_from) if hints_from else ResourceHints()
+        _warn_if_no_schema(client, hints if hints_from else None, guessing=guess)
+        if guess:
+            _guess_names(client, hints, wordlist_path)
 
     found_tables = []
     found_rpcs = []
@@ -225,7 +307,7 @@ def enum(ctx, tables, rpc, buckets):
 
     if tables:
         console.print("[bold]Enumerating tables...[/bold]")
-        found_tables = enumerate_tables(client)
+        found_tables = enumerate_tables(client, hints.tables if hints else None)
         t = RichTable(title="Tables")
         t.add_column("Name")
         t.add_column("Accessible")
@@ -242,7 +324,7 @@ def enum(ctx, tables, rpc, buckets):
 
     if rpc:
         console.print("[bold]Enumerating RPC functions...[/bold]")
-        found_rpcs = enumerate_rpc_functions(client)
+        found_rpcs = enumerate_rpc_functions(client, hints.rpcs if hints else None)
         if found_rpcs:
             t = RichTable(title="RPC Functions")
             t.add_column("Name")
@@ -336,6 +418,7 @@ def dump(ctx, table_names, out_dir):
     if not table_names:
         console.print("[bold]Discovering tables...[/bold]")
         try:
+            _warn_if_no_schema(client)
             tables = enumerate_tables(client)
         except requests.exceptions.ConnectionError:
             creds = ctx.obj["creds"]
@@ -383,6 +466,7 @@ def test(ctx, rls, rpc, buckets, edge_functions, output):
 
     if run_all or rls:
         console.print("[bold]Enumerating tables for RLS check...[/bold]")
+        _warn_if_no_schema(client)
         tables = enumerate_tables(client)
 
     if run_all or rpc:
@@ -433,9 +517,10 @@ def test_write(ctx, table_names, dry_run, output):
         return
 
     if table_names:
-        tables = [t for t in enumerate_tables(client) if t.name in table_names]
+        tables = [t for t in enumerate_tables(client, list(table_names)) if t.name in table_names]
     else:
         console.print("[bold]Enumerating tables...[/bold]")
+        _warn_if_no_schema(client)
         tables = enumerate_tables(client)
 
     console.print(f"[bold]Running write tests on {len(tables)} table(s)...[/bold]")
@@ -531,10 +616,15 @@ def signup(ctx, email, password, save_token):
 @cli.command("all")
 @click.argument("target")
 @click.option("--write", is_flag=True, default=False, help="Enable active write tests (INSERT/UPDATE/DELETE)")
-@click.option("--skip-signup", is_flag=True, default=False)
+@click.option("--signup", is_flag=True, default=False,
+              help="Sign up a throwaway account (or reuse a cached user token) and re-probe tables as 'authenticated'")
+@click.option("--signup-email", default=None, help="Email for --signup (default: random @example.com)")
+@click.option("--guess/--no-guess", default=True, show_default=True,
+              help="When the OpenAPI spec is closed, probe a wordlist and harvest PostgREST name hints")
+@click.option("--wordlist", "wordlist_path", default=None, help="Table-name wordlist (one per line) for --guess")
 @click.option("--output", "-o", default=None, help="Write JSON report to this file")
 @click.pass_context
-def run_all(ctx, target, write, skip_signup, output):
+def run_all(ctx, target, write, signup, signup_email, guess, wordlist_path, output):
     """Full scan: discover credentials then run all checks. Write tests are skipped unless --write is passed."""
     output = output or ctx.obj.get("output")
 
@@ -547,6 +637,9 @@ def run_all(ctx, target, write, skip_signup, output):
         if cached:
             anon_key = cached.anon_key
             console.print(f"[dim]Using cached anon key for {project_ref}[/dim]")
+
+    cached = cache_mod.get_credentials(project_ref) if project_ref else None
+    user_token = cached.user_token if cached and cached.anon_key == anon_key else None
 
     if not (project_ref and anon_key):
         console.print(f"[bold]Step 1: Discovering credentials from {target}[/bold]")
@@ -568,25 +661,43 @@ def run_all(ctx, target, write, skip_signup, output):
         anon_key = creds.anon_key
         cache_mod.add_credentials(creds)
         console.print(f"  [green]Found: {project_ref}[/green]")
+        console.print(f"  [green]Key:   {anon_key}[/green]")
+        console.print(f"  [dim]Source: {creds.source}[/dim]")
     else:
-        creds = Credentials(project_ref=project_ref, anon_key=anon_key)
+        creds = Credentials(project_ref=project_ref, anon_key=anon_key, user_token=user_token)
 
     client = SupabaseClient(creds, verbose=ctx.obj.get("verbose", False))
 
     # Step 2: enumerate
     console.print("[bold]Step 2: Enumerating resources...[/bold]")
     try:
-        tables = enumerate_tables(client)
+        schema_error = client.openapi_error()
     except requests.exceptions.ConnectionError:
         console.print(f"[red]Connection failed: could not resolve {creds.base_url}[/red]")
         console.print("[yellow]The Supabase project may be deleted, paused, or using a custom domain.[/yellow]")
         sys.exit(1)
-    rpcs = enumerate_rpc_functions(client)
+    # Client JS is the only source of names when the schema is closed; also yields edge functions
+    hints = collect_hints(target)
+    if schema_error:
+        _warn_if_no_schema(client, hints, guessing=guess)
+        if guess:
+            _guess_names(client, hints, wordlist_path)
+    tables = enumerate_tables(client, hints.tables)
+    rpcs = enumerate_rpc_functions(client, hints.rpcs)
     buckets = enumerate_buckets(client)
+    console.print(f"  {len(tables)} tables, {len(rpcs)} RPCs, {len(buckets)} buckets")
 
     # Step 3: passive checks
     console.print("[bold]Step 3: Passive security checks...[/bold]")
-    edge_functions, findings = run_all_passive_checks(client, tables, rpcs, buckets, [])
+    edge_functions, findings = run_all_passive_checks(client, tables, rpcs, buckets, hints.edge_functions)
+
+    if signup:
+        console.print("[bold]Step 3b: Re-probing tables as an authenticated user...[/bold]")
+        if _obtain_user_token(client, signup_email):
+            client.use_user_token()
+            auth_tables = enumerate_tables(client, hints.tables)
+            client.use_anon_key()
+            findings.extend(check_authenticated_access(tables, auth_tables))
 
     # Step 4: write tests (opt-in only)
     write_results = []

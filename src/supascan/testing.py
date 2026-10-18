@@ -185,6 +185,70 @@ def check_edge_function_auth(
     return results, findings
 
 
+def check_auth_settings(client: SupabaseClient) -> list[Finding]:
+    """Open self-signup means every 'authenticated' RLS policy is effectively public."""
+    try:
+        resp = client.get_auth_settings()
+        settings = resp.json() if resp.status_code == 200 else {}
+    except Exception:
+        return []
+    if not settings or settings.get("disable_signup", True):
+        return []
+    providers = sorted(k for k, v in (settings.get("external") or {}).items() if v is True)
+    autoconfirm = bool(settings.get("mailer_autoconfirm"))
+    return [
+        Finding(
+            severity=Severity.low if autoconfirm else Severity.info,
+            type="open_signup",
+            title="Self-signup is enabled" + (" without email confirmation" if autoconfirm else ""),
+            description=(
+                "Anyone can create an account and obtain an 'authenticated' JWT. Any RLS policy granted "
+                "to the 'authenticated' role (e.g. USING (true) or auth.role() = 'authenticated') is "
+                "therefore readable by the public."
+                + (" Email confirmation is disabled, so a session is issued immediately." if autoconfirm else "")
+            ),
+            affected_resource="Auth: /auth/v1/settings",
+            recommendation=(
+                "If the app is not meant for open registration, disable signups. Otherwise scope "
+                "policies to the row owner (auth.uid() = user_id) rather than the authenticated role."
+            ),
+            evidence={"providers": providers, "mailer_autoconfirm": autoconfirm},
+        )
+    ]
+
+
+def check_authenticated_access(anon_tables: list[TableInfo], auth_tables: list[TableInfo]) -> list[Finding]:
+    """Flag tables that return rows to a freshly signed-up user but not to anon."""
+    anon_with_data = {t.name for t in anon_tables if t.accessible and t.sample_data}
+    findings = []
+    for table in auth_tables:
+        if not (table.accessible and table.sample_data) or table.name in anon_with_data:
+            continue
+        findings.append(
+            Finding(
+                severity=Severity.high,
+                type="rls_authenticated_overexposed",
+                title=f"Table '{table.name}' readable by any signed-up user",
+                description=(
+                    f"A brand-new account with no data of its own can read rows from '{table.name}'. "
+                    "The RLS policy likely grants the 'authenticated' role instead of the row owner."
+                ),
+                affected_resource=f"Table: {table.name}",
+                recommendation=(
+                    f"Scope the SELECT policy on {table.name} to the owner, e.g. "
+                    "USING (auth.uid() = user_id)."
+                ),
+                evidence={
+                    "table": table.name,
+                    "columns": sorted([c.name for c in table.columns]),
+                    "row_count": len(table.sample_data),
+                    "sample_data": table.sample_data[:1],
+                },
+            )
+        )
+    return findings
+
+
 def run_all_passive_checks(
     client: SupabaseClient,
     tables: list[TableInfo],
@@ -194,6 +258,7 @@ def run_all_passive_checks(
 ) -> tuple[list[EdgeFunction], list[Finding]]:
     findings: list[Finding] = []
     findings.extend(check_rls(tables))
+    findings.extend(check_auth_settings(client))
     findings.extend(check_public_buckets(buckets))
     findings.extend(check_public_rpcs(rpcs))
     edge_functions, edge_findings = check_edge_function_auth(client, edge_function_names)
